@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <path id="blade" d="M64 16 C 77 30 79 50 64 64 C 49 50 51 30 64 16 Z"/>
+  </defs>
+  <circle cx="64" cy="64" r="58" fill="#3584e4"/>
+  <g fill="#ffffff" transform="rotate(45 64 64)">
+    <use href="#blade"/>
+    <use href="#blade" transform="rotate(90 64 64)"/>
+    <use href="#blade" transform="rotate(180 64 64)"/>
+    <use href="#blade" transform="rotate(270 64 64)"/>
+  </g>
+  <circle cx="64" cy="64" r="11" fill="#3584e4" stroke="#ffffff" stroke-width="6"/>
+</svg>

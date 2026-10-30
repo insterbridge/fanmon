@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fan Monitor
+GenericName=Thermal monitor
+Comment=Show EC fan mode and temperatures
+Exec=fanmon
+Icon=fanmon
+Terminal=false
+Categories=System;Monitor;
+Keywords=fan;temperature;thermal;EC;
+StartupNotify=true

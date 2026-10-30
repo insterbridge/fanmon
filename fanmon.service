@@ -1,0 +1,15 @@
+[Unit]
+Description=fanmon EC fan/temperature sampler
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/fanmon-sampler
+RuntimeDirectory=fanmon
+RuntimeDirectoryMode=0755
+Restart=always
+RestartSec=2
+Nice=10
+
+[Install]
+WantedBy=multi-user.target
