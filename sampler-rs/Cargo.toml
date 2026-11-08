@@ -1,0 +1,8 @@
+[package]
+name = "fanmon-sampler"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fanmon-sampler"
+path = "src/main.rs"

@@ -1,7 +1,10 @@
-# python
+# Python
 __pycache__/
 *.py[cod]
 
-# omp agent state (sessions, caches) — project skills are tracked
+# Rust build output
+/sampler-rs/target/
+
+# OMP agent state (sessions, caches) — project skills are tracked
 .omp/*
 !.omp/skills/

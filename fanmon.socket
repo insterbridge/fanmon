@@ -1,0 +1,12 @@
+[Unit]
+Description=fanmon on-demand sampler socket
+
+[Socket]
+ListenStream=/run/fanmon.sock
+Accept=yes
+SocketUser=@FANMON_SOCKET_UID@
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

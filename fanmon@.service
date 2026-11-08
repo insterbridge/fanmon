@@ -1,0 +1,12 @@
+[Unit]
+Description=fanmon sampler connection %I
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/fanmon-sampler
+User=root
+Group=root
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Restart=no

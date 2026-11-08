@@ -1,5 +1,5 @@
 #!/bin/sh
-# fanmon: remove the root sampler and systemd service. Run as root.
+# fanmon: remove the sampler, socket and legacy systemd service. Run as root.
 set -eu
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -7,7 +7,12 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+systemctl disable --now fanmon.socket 2>/dev/null || true
 systemctl disable --now fanmon.service 2>/dev/null || true
-rm -f /etc/systemd/system/fanmon.service /usr/local/libexec/fanmon-sampler
+systemctl stop 'fanmon@*.service' 2>/dev/null || true
+rm -f /etc/systemd/system/fanmon.socket \
+    /etc/systemd/system/fanmon@.service \
+    /etc/systemd/system/fanmon.service \
+    /usr/local/libexec/fanmon-sampler
 systemctl daemon-reload
-echo "fanmon sampler removed."
+echo "fanmon sampler and systemd units removed."

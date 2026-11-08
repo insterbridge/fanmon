@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """fanmon: fan mode and temperature monitor (GTK4 + libadwaita).
 
-Reads the JSON snapshot written by the fanmon sampler (/run/fanmon/status.json)
-and shows the EC fan mode, the EC control temperature, CPU/ACPI temperatures and
-the raw EC fan registers. Layout follows the GNOME/libadwaita style used by the
-Powersupply app: a clamped column of heading + boxed-list sections.
-
-If the sampler is not installed or not running, the window shows a status page
-with an "Install Sampler…" button that runs the installer via pkexec (one
-password prompt); the view switches to live data automatically once the
-sampler starts writing.
+Opens a Unix socket to the systemd-activated Rust sampler while the window is
+open. The sampler streams newline-delimited JSON snapshots; closing the window
+closes the socket and lets the sampler exit. The GUI shows a setup page with an
+"Install/Repair Sampler…" button if the socket is unavailable; pkexec is used
+only for the one-time system installation, not normal launches.
 """
 import json
 import os
@@ -24,7 +20,7 @@ gi.require_version('Adw', '1')
 
 from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
-STATUS_FILE = '/run/fanmon/status.json'
+SOCKET_PATH = '/run/fanmon.sock'
 SAMPLER_BIN = '/usr/local/libexec/fanmon-sampler'
 APP_ID = 'io.github.insterbridge.Fanmon'
 
@@ -40,7 +36,8 @@ def _install_script():
 
 INSTALL_SCRIPT = _install_script()
 INSTALL_HINT = 'sudo ' + INSTALL_SCRIPT
-REFRESH_SECONDS = 1
+RETRY_SECONDS = 1
+STALE_CHECK_SECONDS = 1
 STALE_AFTER = 5
 
 
@@ -108,7 +105,7 @@ class FanmonWindow(Adw.ApplicationWindow):
         self.window_title = Adw.WindowTitle(title='Fan Monitor')
         header = Adw.HeaderBar(title_widget=self.window_title)
 
-        self.install_button = Gtk.Button(label='Install Sampler…',
+        self.install_button = Gtk.Button(label='Install/Repair Sampler…',
                                          halign=Gtk.Align.CENTER)
         self.install_button.add_css_class('suggested-action')
         self.install_button.connect('clicked', self.on_install_clicked)
@@ -118,8 +115,9 @@ class FanmonWindow(Adw.ApplicationWindow):
         self.status_page = Adw.StatusPage(
             icon_name='dialog-warning-symbolic',
             title='Fan data unavailable',
-            description='The fanmon sampler is not running.\n\n'
-                        'Install and start it with:\n' + INSTALL_HINT,
+            description='The on-demand root sampler runs only while Fan Monitor is open.\n\n'
+                        'Initial system setup requires authentication once.\n\n'
+                        'Install and enable the socket with:\n' + INSTALL_HINT,
         )
         self.status_page.set_child(self.install_button)
 
@@ -149,15 +147,228 @@ class FanmonWindow(Adw.ApplicationWindow):
         self.set_content(toolbar)
 
         self._install_proc = None
-        self._timeout = GLib.timeout_add_seconds(REFRESH_SECONDS, self.refresh)
+        self._connection = None
+        self._input_stream = None
+        self._output_stream = None
+        self._cancellable = None
+        self._connecting = False
+        self._closed = False
+        self._retry_timeout = None
+        self._last_snapshot_ts = None
+        self._stream_error = False
+        self._stale_timeout = GLib.timeout_add_seconds(
+            STALE_CHECK_SECONDS, self.refresh_staleness)
         self.connect('close-request', self.on_close_request)
-        self.refresh()
+        self._connect()
 
     def on_close_request(self, *_args):
-        if self._timeout:
-            GLib.source_remove(self._timeout)
-            self._timeout = None
+        self._closed = True
+        if self._stale_timeout:
+            GLib.source_remove(self._stale_timeout)
+            self._stale_timeout = None
+        if self._retry_timeout:
+            GLib.source_remove(self._retry_timeout)
+            self._retry_timeout = None
+        self._release_connection()
         return False
+
+    def _connect(self):
+        if self._closed or self._connecting or self._connection is not None:
+            return
+        self._connecting = True
+        self._stream_error = False
+        self._cancellable = Gio.Cancellable()
+        client = Gio.SocketClient.new()
+        try:
+            client.connect_async(
+                Gio.UnixSocketAddress.new(SOCKET_PATH),
+                self._cancellable, self._on_connected, None)
+        except (GLib.Error, TypeError):
+            self._connecting = False
+            self._cancellable = None
+            self._show_unavailable()
+            self._schedule_retry()
+
+    def _on_connected(self, client, result, _user_data=None):
+        try:
+            connection = client.connect_finish(result)
+        except GLib.Error:
+            if not self._closed:
+                self._connecting = False
+                self._cancellable = None
+                self._show_unavailable()
+                self._schedule_retry()
+            return
+
+        if self._closed:
+            connection.close(None)
+            return
+        self._connecting = False
+        self._connection = connection
+        self._input_stream = Gio.DataInputStream.new(
+            connection.get_input_stream())
+        self._output_stream = connection.get_output_stream()
+        try:
+            self._output_stream.write_all_async(
+                b'START\n', GLib.PRIORITY_DEFAULT, self._cancellable,
+                self._on_started, None)
+        except Exception as err:
+            self._end_connection(f'Could not start sampler: {err}')
+
+    def _on_started(self, stream, result, _user_data=None):
+        if self._closed or self._connection is None:
+            return
+        try:
+            write_result = stream.write_all_finish(result)
+            success = (write_result[0] if isinstance(write_result, tuple)
+                       else write_result)
+        except Exception as err:
+            self._end_connection(f'Could not start sampler: {err}')
+            return
+        if not success:
+            self._end_connection('Could not start sampler.')
+            return
+        self._read_next_line()
+
+    def _read_next_line(self):
+        if self._closed or self._connection is None:
+            return
+        try:
+            self._input_stream.read_line_async(
+                GLib.PRIORITY_DEFAULT, self._cancellable,
+                self._on_line_read, None)
+        except Exception as err:
+            self._end_connection(f'Could not read sampler data: {err}')
+
+    def _on_line_read(self, stream, result, _user_data=None):
+        if self._closed or self._connection is None:
+            return
+        try:
+            read_result = stream.read_line_finish_utf8(result)
+            line = (read_result[0] if isinstance(read_result, tuple)
+                    else read_result)
+        except Exception as err:
+            self._end_connection(f'Could not read sampler data: {err}')
+            return
+
+        if line is None:
+            self._end_connection()
+            return
+
+        try:
+            data = json.loads(line)
+            if not isinstance(data, dict):
+                raise ValueError('snapshot is not a JSON object')
+            if 'error' in data:
+                self._stream_error = True
+                message = str(data['error'])
+                self.show_status('Sampler error', 'Sampler error', message)
+            else:
+                self._render_snapshot(data)
+        except Exception as err:
+            self._end_connection(f'Invalid sampler data: {err}')
+            return
+        self._read_next_line()
+
+    def _render_snapshot(self, data):
+        fan = data['fan']
+        timestamp = data['ts']
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise ValueError('snapshot timestamp is not numeric')
+        stamp = time.strftime('%H:%M:%S', time.localtime(timestamp))
+        fan_rows = [
+            ('Mode', fmt_mode(fan.get('state'))),
+            ('EC temperature', fmt_temp(fan.get('temp'))),
+        ]
+
+        temps = [(sensor['name'], fmt_temp(sensor['temp']))
+                 for sensor in data.get('cpu', [])]
+        for zone in data.get('zones', []):
+            # x86_pkg_temp is the same die sensor as the coretemp Package row
+            if zone['name'] != 'x86_pkg_temp':
+                temps.append((zone['name'], fmt_temp(zone['temp'])))
+
+        ec_rows = [
+            ('State register (0x55)', '0x{:02X}'.format(fan['state'])),
+            ('Speed register (0x5C:0x5D)',
+             '0x{:02X}{:02X}'.format(fan.get('speed_hi', 0),
+                                     fan.get('speed_lo', 0))),
+        ]
+        self.sections['fan'].update(fan_rows)
+        self.sections['temperature'].update(temps)
+        self.sections['ec'].update(ec_rows)
+        self._last_snapshot_ts = timestamp
+        self.stack.set_visible_child_name('content')
+        self.refresh_staleness()
+
+    def refresh_staleness(self):
+        if self._closed:
+            return GLib.SOURCE_REMOVE
+        if (self._last_snapshot_ts is not None
+                and self.stack.get_visible_child_name() == 'content'):
+            age = time.time() - self._last_snapshot_ts
+            stamp = time.strftime(
+                '%H:%M:%S', time.localtime(self._last_snapshot_ts))
+            if age > STALE_AFTER:
+                self.window_title.set_subtitle(
+                    f'Stale — last update {stamp}')
+            else:
+                self.window_title.set_subtitle(f'Updated {stamp}')
+        return GLib.SOURCE_CONTINUE
+
+    def _show_unavailable(self):
+        if os.path.exists(SAMPLER_BIN):
+            self.show_status(
+                'Sampler socket unavailable', 'Sampler socket unavailable',
+                'The on-demand sampler socket is unavailable.\n\n'
+                'Click Install/Repair to enable it, or run:\n' + INSTALL_HINT)
+        else:
+            self.show_status(
+                'Sampler not installed', 'Sampler not installed',
+                'The Rust sampler and socket are not installed.\n\n'
+                'Click Install/Repair and authenticate once, or run:\n' + INSTALL_HINT)
+
+    def _schedule_retry(self):
+        if self._closed or self._retry_timeout is not None:
+            return
+        self._retry_timeout = GLib.timeout_add_seconds(
+            RETRY_SECONDS, self._retry_connection)
+
+    def _retry_connection(self):
+        self._retry_timeout = None
+        self._connect()
+        return GLib.SOURCE_REMOVE
+
+    def _retry_now(self):
+        if self._retry_timeout:
+            GLib.source_remove(self._retry_timeout)
+            self._retry_timeout = None
+        self._connect()
+
+    def _release_connection(self):
+        cancellable, self._cancellable = self._cancellable, None
+        connection, self._connection = self._connection, None
+        self._input_stream = None
+        self._output_stream = None
+        self._connecting = False
+        if cancellable is not None:
+            cancellable.cancel()
+        if connection is not None:
+            try:
+                connection.close(None)
+            except GLib.Error:
+                pass
+
+    def _end_connection(self, error=None):
+        had_stream_error = self._stream_error
+        self._release_connection()
+        if self._closed:
+            return
+        if error is not None:
+            self.show_status('Sampler error', 'Sampler error', str(error))
+        elif not had_stream_error:
+            self._show_unavailable()
+        self._schedule_retry()
 
     def on_install_clicked(self, _button):
         if self._install_proc is not None:
@@ -179,68 +390,19 @@ class FanmonWindow(Adw.ApplicationWindow):
         try:
             proc.wait_check_finish(result)
         except GLib.Error:
-            pass  # cancelled or failed; refresh() re-shows the status page
+            pass  # cancelled or failed; the connection retry shows status
         self._install_proc = None
         self.install_button.set_sensitive(True)
-        self.install_button.set_label('Install Sampler…')
-        self.refresh()
+        self.install_button.set_label('Install/Repair Sampler…')
+        if self._connection is None and not self._connecting:
+            self._show_unavailable()
+        self._retry_now()
 
     def show_status(self, subtitle, title, description):
         self.status_page.set_title(title)
         self.status_page.set_description(description)
         self.stack.set_visible_child_name('status')
         self.window_title.set_subtitle(subtitle)
-
-    def refresh(self):
-        try:
-            with open(STATUS_FILE) as handle:
-                data = json.load(handle)
-        except (OSError, ValueError):
-            if os.path.exists(SAMPLER_BIN):
-                self.show_status(
-                    'Sampler not running', 'Sampler not running',
-                    'The fanmon sampler service is not running.\n\n'
-                    'Click Install to reinstall and start it, or run:\n'
-                    'sudo systemctl restart fanmon')
-            else:
-                self.show_status(
-                    'Sampler not installed', 'Sampler not installed',
-                    'The background sampler reads the EC fan registers\n'
-                    'and needs root once.\n\n'
-                    'Click Install and authenticate, or run:\n' + INSTALL_HINT)
-            return GLib.SOURCE_CONTINUE
-
-        if 'error' in data:
-            self.show_status('Sampler error', 'Sampler error', str(data['error']))
-            return GLib.SOURCE_CONTINUE
-
-        fan = data['fan']
-        self.sections['fan'].update([
-            ('Mode', fmt_mode(fan.get('state'))),
-            ('EC temperature', fmt_temp(fan.get('temp'))),
-        ])
-
-        temps = [(sensor['name'], fmt_temp(sensor['temp'])) for sensor in data.get('cpu', [])]
-        for zone in data.get('zones', []):
-            # x86_pkg_temp is the same die sensor as the coretemp Package row
-            if zone['name'] != 'x86_pkg_temp':
-                temps.append((zone['name'], fmt_temp(zone['temp'])))
-        self.sections['temperature'].update(temps)
-
-        self.sections['ec'].update([
-            ('State register (0x55)', '0x{:02X}'.format(fan['state'])),
-            ('Speed register (0x5C:0x5D)',
-             '0x{:02X}{:02X}'.format(fan.get('speed_hi', 0), fan.get('speed_lo', 0))),
-        ])
-
-        self.stack.set_visible_child_name('content')
-        age = time.time() - data['ts']
-        stamp = time.strftime('%H:%M:%S', time.localtime(data['ts']))
-        if age > STALE_AFTER:
-            self.window_title.set_subtitle(f'Stale — last update {stamp}')
-        else:
-            self.window_title.set_subtitle(f'Updated {stamp}')
-        return GLib.SOURCE_CONTINUE
 
 
 class FanmonApplication(Adw.Application):
