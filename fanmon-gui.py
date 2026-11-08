@@ -39,6 +39,7 @@ INSTALL_HINT = 'sudo ' + INSTALL_SCRIPT
 RETRY_SECONDS = 1
 STALE_CHECK_SECONDS = 1
 STALE_AFTER = 5
+RETRY_MAX_SECONDS = 30
 
 
 def fmt_temp(value):
@@ -156,6 +157,7 @@ class FanmonWindow(Adw.ApplicationWindow):
         self._retry_timeout = None
         self._last_snapshot_ts = None
         self._stream_error = False
+        self._retry_delay = RETRY_SECONDS
         self._stale_timeout = GLib.timeout_add_seconds(
             STALE_CHECK_SECONDS, self.refresh_staleness)
         self.connect('close-request', self.on_close_request)
@@ -298,6 +300,7 @@ class FanmonWindow(Adw.ApplicationWindow):
         self.sections['temperature'].update(temps)
         self.sections['ec'].update(ec_rows)
         self._last_snapshot_ts = timestamp
+        self._retry_delay = RETRY_SECONDS
         self.stack.set_visible_child_name('content')
         self.refresh_staleness()
 
@@ -328,11 +331,17 @@ class FanmonWindow(Adw.ApplicationWindow):
                 'The Rust sampler and socket are not installed.\n\n'
                 'Click Install/Repair and authenticate once, or run:\n' + INSTALL_HINT)
 
-    def _schedule_retry(self):
+    def _schedule_retry(self, backoff=False):
         if self._closed or self._retry_timeout is not None:
             return
+        # A missing socket is cheap to retry; a sampler that keeps failing
+        # would otherwise spawn a fresh root process every second.
+        delay = RETRY_SECONDS
+        if backoff:
+            delay = self._retry_delay
+            self._retry_delay = min(self._retry_delay * 2, RETRY_MAX_SECONDS)
         self._retry_timeout = GLib.timeout_add_seconds(
-            RETRY_SECONDS, self._retry_connection)
+            delay, self._retry_connection)
 
     def _retry_connection(self):
         self._retry_timeout = None
@@ -343,6 +352,7 @@ class FanmonWindow(Adw.ApplicationWindow):
         if self._retry_timeout:
             GLib.source_remove(self._retry_timeout)
             self._retry_timeout = None
+        self._retry_delay = RETRY_SECONDS
         self._connect()
 
     def _release_connection(self):
@@ -368,7 +378,7 @@ class FanmonWindow(Adw.ApplicationWindow):
             self.show_status('Sampler error', 'Sampler error', str(error))
         elif not had_stream_error:
             self._show_unavailable()
-        self._schedule_retry()
+        self._schedule_retry(backoff=had_stream_error)
 
     def on_install_clicked(self, _button):
         if self._install_proc is not None:
